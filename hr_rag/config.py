@@ -14,9 +14,17 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 CHROMA_DIR = ROOT_DIR / "data" / "chroma_store"
 EMPLOYEE_DB_PATH = ROOT_DIR / "data" / "employees.db"
 
-# Below this, the light model's answer is treated as low-confidence and
-# escalated to the deep model even if it did not explicitly ask to escalate.
+# v1-only: below this, the light model's answer was treated as low-confidence
+# and escalated even without an explicit escalate call. Superseded in v2 by
+# the model calling escalate_to_deep_reasoning itself; kept only in case v1's
+# pipeline.py-era code paths are ever revisited.
 CONFIDENCE_THRESHOLD = 0.7
+
+# LangGraph's built-in loop cap (config.recursion_limit on graph.invoke) --
+# guards against a runaway agent/tool-call loop within a single turn.
+MAX_ITERATIONS = 12
+
+PASSWORD_HASH_ITERATIONS = 100_000
 
 # Web search is restricted to this allowlist (PRD 5.1: "Constrained to a
 # trusted domain allowlist"). Extend as needed for real regulatory sources.

@@ -14,6 +14,7 @@ heuristic and a cross-encoder scores each (query, chunk) pair directly.
 """
 
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,21 +40,39 @@ _bm25_cache = None
 # Lazily-loaded cross-encoder -- loaded once per process, not per query.
 _reranker = None
 
+# The v2 agent's ToolNode can run multiple tool calls in parallel threads
+# within one turn (e.g. search_policy_db + search_employee_record called
+# together). chromadb.PersistentClient(...) is NOT safe to construct
+# concurrently from multiple threads for the same path -- it races on
+# chromadb's internal client registry. Cache one client/collection per
+# process, built under a lock, instead of constructing a fresh client on
+# every call.
+_client = None
+_collection = None
+_client_lock = threading.Lock()
+
 
 def _get_collection():
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    return client.get_or_create_collection(COLLECTION_NAME)
+    global _client, _collection
+    if _collection is None:
+        with _client_lock:
+            if _collection is None:  # re-check inside the lock
+                _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+                _collection = _client.get_or_create_collection(COLLECTION_NAME)
+    return _collection
 
 
 def _get_bm25():
     global _bm25_cache
     if _bm25_cache is None:
-        collection = _get_collection()
-        data = collection.get()
-        ids, docs, metadatas = data["ids"], data["documents"], data["metadatas"]
-        tokenized = [doc.lower().split() for doc in docs]
-        bm25 = BM25Okapi(tokenized) if docs else None
-        _bm25_cache = (bm25, ids, docs, metadatas)
+        with _client_lock:
+            if _bm25_cache is None:
+                collection = _get_collection()
+                data = collection.get()
+                ids, docs, metadatas = data["ids"], data["documents"], data["metadatas"]
+                tokenized = [doc.lower().split() for doc in docs]
+                bm25 = BM25Okapi(tokenized) if docs else None
+                _bm25_cache = (bm25, ids, docs, metadatas)
     return _bm25_cache
 
 
