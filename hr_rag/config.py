@@ -27,3 +27,11 @@ WEB_SEARCH_ALLOWED_DOMAINS = [
     "eeoc.gov",
 ]
 WEB_SEARCH_MAX_USES = 3
+
+# Local cross-encoder reranker applied after hybrid (dense+BM25) fusion in
+# vector_store.search(). Small, fast, well-established for this exact task.
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# How many RRF-fused candidates to hand to the reranker before cutting down
+# to the final n_results -- wider than n_results so reranking has real
+# candidates to re-order, not just re-confirm the fusion's top few.
+RERANK_POOL_SIZE = 20
