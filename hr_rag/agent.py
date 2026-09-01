@@ -25,6 +25,7 @@ from typing_extensions import TypedDict
 from hr_rag.config import ANTHROPIC_API_KEY, DEEP_MODEL, LIGHT_MODEL, MAX_ITERATIONS
 from hr_rag.guardrails import SOURCE_PRIORITY_INSTRUCTION, wrap_untrusted
 from hr_rag.sources import employee_db, vector_store, web_search
+from hr_rag.table_catalog import TABLE_CATALOG
 
 _RETRIEVAL_TOOL_NAMES = {"search_policy_db", "search_employee_record", "search_web"}
 
@@ -54,12 +55,29 @@ def search_policy_db(query: str) -> str:
 
 @tool
 def search_employee_record(
-    topic: str, employee_id: Annotated[str, InjectedState("employee_id")]
+    tables: list[str], employee_id: Annotated[str, InjectedState("employee_id")]
 ) -> str:
-    """Looks up the CURRENTLY LOGGED-IN employee's own HR record (leave
-    balance, compensation, expense reports, tenure, department, etc.).
+    """Looks up the CURRENTLY LOGGED-IN employee's own HR record. The core
+    profile (name, title, department, tenure, manager, status) is always
+    included automatically. Request specific tables by name in `tables`
+    when relevant -- see the tool description for what's available.
     Always scoped to the logged-in user -- cannot look up anyone else's data."""
-    return wrap_untrusted(employee_db.search(employee_id, topic))
+    return wrap_untrusted(employee_db.search(employee_id, tables))
+
+
+# @tool reads its description from the docstring above at decoration time,
+# which can't be an f-string -- so the catalog-derived table list is spliced
+# in afterward, keeping TABLE_CATALOG the single source of truth instead of
+# duplicating table descriptions here by hand.
+_TABLE_DOCS = "\n".join(f"- {name}: {info['description']}" for name, info in TABLE_CATALOG.items())
+search_employee_record.description = (
+    "Looks up the CURRENTLY LOGGED-IN employee's own HR record. The core "
+    "profile (name, title, department, tenure, manager, status) is always "
+    "included automatically -- you don't need to request it. Additionally "
+    "request any of these tables by name in `tables` if relevant:\n"
+    f"{_TABLE_DOCS}\n"
+    "Always scoped to the logged-in user -- cannot look up anyone else's data."
+)
 
 
 @tool

@@ -23,6 +23,7 @@ from datetime import date, datetime
 
 from hr_rag.config import EMPLOYEE_DB_PATH
 from hr_rag.models import RetrievedChunk
+from hr_rag.table_catalog import TABLE_CATALOG
 
 _EMPLOYEE_COLUMNS = (
     "employee_id, full_name, email, job_title, department, employment_type, "
@@ -119,31 +120,15 @@ def get_my_expense_reports(employee_id: str) -> list[dict]:
         conn.close()
 
 
-# Query keywords that gate which auxiliary tables get pulled into a
-# retrieval alongside the always-included core record. Keeps compensation
-# (sensitive) and other tables out of unrelated answers rather than
-# dumping the whole employee profile into every prompt.
-_LEAVE_BALANCE_KEYWORDS = (
-    "balance", "leave", "pto", "sick", "accrual", "days left",
-    "days do i have", "time off", "days off",
-)
-_LEAVE_REQUEST_KEYWORDS = ("request", "approved", "pending", "denied", "time off i booked", "schedule")
-_COMPENSATION_KEYWORDS = ("salary", "pay band", "compensation", "comp ", "how much do i make", "raise")
-_EXPENSE_KEYWORDS = ("expense", "reimburse", "reimbursement")
-
-
-def _matches(query: str, keywords: tuple[str, ...]) -> bool:
-    lowered = query.lower()
-    return any(kw in lowered for kw in keywords)
-
-
-def search(employee_id: str, query: str) -> list[RetrievedChunk]:
-    """Entry point used by the pipeline's employee_db source.
+def search(employee_id: str, tables: list[str]) -> list[RetrievedChunk]:
+    """Entry point used by the agent's search_employee_record tool.
 
     Always includes the employee's core record (needed for tenure/role/
-    department-based eligibility checks even when not explicitly asked for),
-    plus whichever auxiliary tables the query keywords indicate are relevant.
-    Every lookup is scoped to `employee_id` -- see module docstring.
+    department-based eligibility checks even when not explicitly asked
+    for), plus whichever of TABLE_CATALOG's tables the caller explicitly
+    requested. Unrecognized names in `tables` are silently ignored --
+    a hallucinated table name shouldn't crash the tool call. Every lookup
+    is scoped to `employee_id` -- see module docstring.
     """
     record = get_my_record(employee_id)
     if record is None:
@@ -163,7 +148,9 @@ def search(employee_id: str, query: str) -> list[RetrievedChunk]:
         )
     ]
 
-    if _matches(query, _LEAVE_BALANCE_KEYWORDS):
+    requested = set(tables) & set(TABLE_CATALOG)
+
+    if "employee_leaves" in requested:
         leaves = get_my_leaves(employee_id)
         if leaves:
             text = (
@@ -180,7 +167,7 @@ def search(employee_id: str, query: str) -> list[RetrievedChunk]:
             )
             chunks.append(RetrievedChunk(source="employee_db", text=text, metadata={"table": "employee_leaves"}))
 
-    if _matches(query, _LEAVE_REQUEST_KEYWORDS):
+    if "leave_requests" in requested:
         requests = get_my_leave_requests(employee_id)
         if requests:
             text = "; ".join(
@@ -190,7 +177,7 @@ def search(employee_id: str, query: str) -> list[RetrievedChunk]:
             )
             chunks.append(RetrievedChunk(source="employee_db", text=text, metadata={"table": "leave_requests"}))
 
-    if _matches(query, _COMPENSATION_KEYWORDS):
+    if "compensation" in requested:
         comp = get_my_compensation(employee_id)
         if comp:
             text = (
@@ -199,7 +186,7 @@ def search(employee_id: str, query: str) -> list[RetrievedChunk]:
             )
             chunks.append(RetrievedChunk(source="employee_db", text=text, metadata={"table": "compensation"}))
 
-    if _matches(query, _EXPENSE_KEYWORDS):
+    if "expense_reports" in requested:
         expenses = get_my_expense_reports(employee_id)
         if expenses:
             text = "; ".join(
