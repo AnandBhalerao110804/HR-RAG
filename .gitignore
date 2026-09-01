@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Generated/local data -- rebuildable via seed_employees.py + hr_rag.ingest,
+# should not be versioned (and employees.db has sample PII-shaped data)
+data/employees.db
+data/chroma_store/
+
+hr_rag_policy_pack_india/
+
+# OS
+.DS_Store
