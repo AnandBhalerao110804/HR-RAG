@@ -4,9 +4,12 @@ Auth is demo-grade (see hr_rag/auth.py) -- enough to gate access and
 identify who's logged in for this prototype, not enterprise-grade.
 """
 
+import json
+import time
+
 import anthropic
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel
@@ -14,7 +17,6 @@ from pydantic import BaseModel
 from hr_rag import agent, auth, session_store
 from hr_rag.guardrails import ASSISTANT_UNAVAILABLE_ANSWER
 from hr_rag.logging_util import log_error, log_query
-import time
 
 app = FastAPI(title="HR Portal RAG")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -31,13 +33,6 @@ class LoginResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-
-
-class ChatResponse(BaseModel):
-    answer: str
-    escalated: bool
-    escalation_reason: str | None
-    tools_used: list[str]
 
 
 def _require_session(authorization: str | None) -> tuple[str, session_store.AuthSession]:
@@ -70,33 +65,48 @@ def logout(authorization: str | None = Header(default=None)):
     return {"ok": True}
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 def chat(body: ChatRequest, authorization: str | None = Header(default=None)):
     token, session = _require_session(authorization)
-    start = time.monotonic()
-    try:
-        result = agent.run_turn(token, session.employee_id, body.message)
-    except (anthropic.AnthropicError, GraphRecursionError) as e:
-        log_error(employee_id=session.employee_id, query=body.message, error=e)
-        return ChatResponse(
-            answer=ASSISTANT_UNAVAILABLE_ANSWER,
-            escalated=False,
-            escalation_reason=None,
-            tools_used=[],
+
+    def event_stream():
+        start = time.monotonic()
+        tools_used: list[str] = []
+        escalated = False
+        escalation_reason = None
+        try:
+            for event in agent.run_turn_stream(token, session.employee_id, body.message):
+                if event["type"] == "token":
+                    yield f"data: {json.dumps({'type': 'token', 'text': event['text']})}\n\n"
+                else:
+                    tools_used = event["tools_used"]
+                    escalated = event["escalated"]
+                    escalation_reason = event["escalation_reason"]
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "done",
+                                "escalated": escalated,
+                                "escalation_reason": escalation_reason,
+                                "tools_used": tools_used,
+                            }
+                        )
+                        + "\n\n"
+                    )
+        except (anthropic.AnthropicError, GraphRecursionError) as e:
+            log_error(employee_id=session.employee_id, query=body.message, error=e)
+            yield f"data: {json.dumps({'type': 'error', 'message': ASSISTANT_UNAVAILABLE_ANSWER})}\n\n"
+            return
+
+        latency_ms = (time.monotonic() - start) * 1000
+        log_query(
+            employee_id=session.employee_id,
+            query=body.message,
+            sources_selected=tools_used,
+            escalated=escalated,
+            escalation_reason=escalation_reason,
+            latency_ms=latency_ms,
         )
 
-    latency_ms = (time.monotonic() - start) * 1000
-    log_query(
-        employee_id=session.employee_id,
-        query=body.message,
-        sources_selected=result.tools_used,
-        escalated=result.escalated,
-        escalation_reason=result.escalation_reason,
-        latency_ms=latency_ms,
-    )
-    return ChatResponse(
-        answer=result.answer,
-        escalated=result.escalated,
-        escalation_reason=result.escalation_reason,
-        tools_used=result.tools_used,
-    )
+    return StreamingResponse(event_stream(), media_type="text/event-stream")

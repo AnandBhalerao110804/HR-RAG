@@ -2,8 +2,8 @@
 
 Fast way to exercise hr_rag/agent.py without the web layer -- skips real
 login (just picks an employee id like v1's CLI did), but the underlying
-agent.run_turn() is exactly what api.py calls, so behavior matches the
-web UI including multi-turn memory within one run of this script.
+agent.run_turn_stream() is exactly what api.py's /chat endpoint streams
+from, so behavior (including streaming) matches the web UI.
 """
 
 import secrets
@@ -47,16 +47,23 @@ def main():
         if not query:
             continue
 
+        print()
+        escalated = False
+        tools_used: list[str] = []
         try:
-            result = agent.run_turn(token, employee_id, query)
+            for event in agent.run_turn_stream(token, employee_id, query):
+                if event["type"] == "token":
+                    print(event["text"], end="", flush=True)
+                else:
+                    escalated = event["escalated"]
+                    tools_used = event["tools_used"]
         except (anthropic.AnthropicError, GraphRecursionError) as e:
             log_error(employee_id=employee_id, query=query, error=e)
-            print(f"\n{ASSISTANT_UNAVAILABLE_ANSWER}\n")
+            print(f"{ASSISTANT_UNAVAILABLE_ANSWER}\n")
             continue
 
-        print(f"\n{result.answer}\n")
-        tag = " (escalated)" if result.escalated else ""
-        print(f"[tools used: {', '.join(result.tools_used) or 'none'}{tag}]\n")
+        tag = " (escalated)" if escalated else ""
+        print(f"\n\n[tools used: {', '.join(tools_used) or 'none'}{tag}]\n")
 
 
 if __name__ == "__main__":

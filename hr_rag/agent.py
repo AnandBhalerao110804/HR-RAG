@@ -190,25 +190,35 @@ def _extract_text(message: AIMessage) -> str:
     return str(content)
 
 
-def run_turn(token: str, employee_id: str, user_message: str) -> AgentTurnResult:
+def run_turn_stream(token: str, employee_id: str, user_message: str):
+    """Yields {"type": "token", "text": str} for each text delta produced
+    by the agent node (light or deep model) across the whole turn's
+    tool-call loop, then exactly one final
+    {"type": "done", "escalated": bool, "escalation_reason": str | None,
+    "tools_used": list[str]} once the graph reaches END."""
     graph = _get_graph()
     config = {"configurable": {"thread_id": token}, "recursion_limit": MAX_ITERATIONS}
 
     prior_state = graph.get_state(config)
     prior_len = len(prior_state.values.get("messages", [])) if prior_state.values else 0
 
-    result_state = graph.invoke(
-        {
-            "messages": [HumanMessage(content=user_message)],
-            "employee_id": employee_id,
-            "model_tier": "light",
-            "escalated": False,
-            "escalation_reason": None,
-        },
-        config=config,
-    )
+    input_state = {
+        "messages": [HumanMessage(content=user_message)],
+        "employee_id": employee_id,
+        "model_tier": "light",
+        "escalated": False,
+        "escalation_reason": None,
+    }
 
-    new_messages = result_state["messages"][prior_len:]
+    for message_chunk, metadata in graph.stream(input_state, config=config, stream_mode="messages"):
+        if metadata.get("langgraph_node") != "agent":
+            continue
+        text = _extract_text(message_chunk)
+        if text:
+            yield {"type": "token", "text": text}
+
+    final_values = graph.get_state(config).values
+    new_messages = final_values["messages"][prior_len:]
     tools_used = [
         call["name"]
         for msg in new_messages
@@ -216,11 +226,25 @@ def run_turn(token: str, employee_id: str, user_message: str) -> AgentTurnResult
         for call in msg.tool_calls
         if call["name"] in _RETRIEVAL_TOOL_NAMES
     ]
+    yield {
+        "type": "done",
+        "escalated": final_values["escalated"],
+        "escalation_reason": final_values["escalation_reason"],
+        "tools_used": tools_used,
+    }
 
-    final_message = result_state["messages"][-1]
+
+def run_turn(token: str, employee_id: str, user_message: str) -> AgentTurnResult:
+    parts = []
+    done = None
+    for event in run_turn_stream(token, employee_id, user_message):
+        if event["type"] == "token":
+            parts.append(event["text"])
+        else:
+            done = event
     return AgentTurnResult(
-        answer=_extract_text(final_message),
-        escalated=result_state["escalated"],
-        escalation_reason=result_state["escalation_reason"],
-        tools_used=tools_used,
+        answer="".join(parts),
+        escalated=done["escalated"],
+        escalation_reason=done["escalation_reason"],
+        tools_used=done["tools_used"],
     )
