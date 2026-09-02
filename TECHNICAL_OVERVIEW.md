@@ -145,7 +145,7 @@ A LangGraph `StateGraph` with 3 nodes (`agent`, `tools`, `check_escalation`), 4 
 Owns the policy document vector store: chunking on ingest, hybrid search + reranking on query. Detail in section 5.
 
 ### `hr_rag/sources/employee_db.py`
-Parameterized SQL only, `employee_id` always in the `WHERE` clause. `search(employee_id, topic)` always returns the core employee record, plus keyword-gated chunks from `employee_leaves`/`leave_requests`/`compensation`/`expense_reports` depending on what `topic` mentions.
+Parameterized SQL only, `employee_id` always in the `WHERE` clause. `search(employee_id, tables)` always returns the core employee record, plus whichever of `employee_leaves`/`leave_requests`/`compensation`/`expense_reports` the model explicitly requested by name in `tables` — see `hr_rag/table_catalog.py`, the single source of truth for what those tables are and what the model is told about them. All four `employee_id` foreign-key columns are indexed (`data/seed_employees.py`), so every lookup is an indexed `SEARCH`, not a full-table `SCAN` — verified via `EXPLAIN QUERY PLAN`.
 
 ### `hr_rag/sources/web_search.py`
 Calls the Claude API directly with the native `web_search_20260209` server tool (`allowed_domains` from config) and extracts the model's own synthesized summary text as the result — no separate search API, no client-side result parsing.
@@ -211,15 +211,70 @@ stateDiagram-v2
 - **`tools` node**: LangGraph's `ToolNode` executes whichever tools the model called — **in parallel** if the model called more than one at once.
 - **`check_escalation` node**: inspects the preceding `AIMessage` for a call to `escalate_to_deep_reasoning`; if found, flips `state["model_tier"]` to `"deep"` for the rest of this turn.
 - Loop repeats until the model responds with no tool calls, or `MAX_ITERATIONS` (recursion cap) is hit.
+- `agent.run_turn_stream()` drives this exact graph via `graph.stream(..., stream_mode="messages")`, yielding each text token the `agent` node produces (across every loop iteration) as it's generated, then one final event with `escalated`/`escalation_reason`/`tools_used` once the graph reaches `[*]`. `run_turn()` (still used by tests and anywhere a single blocking result is more convenient) is a thin wrapper that just concatenates the streamed tokens.
 
-## 7. End-to-end: one chat turn, start to finish
+## 7. What kind of retrieval happens, and who decides
+
+This is the part that replaced v1's fixed routing: there's no upfront classifier deciding "this needs policy_db." The model itself, inside the `agent` node above, decides per-turn (and can change its mind mid-turn) which of three retrieval types it needs, if any:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Reasoning: turn starts (light model)
+
+    Reasoning --> PolicySearch: needs a policy rule / eligibility criterion
+    Reasoning --> EmployeeSearch: needs the employee's own record
+    Reasoning --> WebSearch: needs external/regulatory info
+    Reasoning --> DirectAnswer: nothing to retrieve (chitchat, or already has enough context from earlier in the conversation)
+
+    PolicySearch --> Reasoning: hybrid-search chunks returned
+    EmployeeSearch --> Reasoning: requested table(s) returned
+    WebSearch --> Reasoning: Claude's web-search summary returned
+
+    Reasoning --> Escalating: not confident / cross-source join / conflicting info / comparative question
+    Escalating --> Reasoning: model_tier flips to "deep", loop continues on the deep model
+
+    Reasoning --> DirectAnswer: model has what it needs
+    DirectAnswer --> [*]
+```
+
+Each retrieval type, concretely:
+
+| Retrieval | Tool | What decides *what* comes back |
+|---|---|---|
+| Policy | `search_policy_db(query)` | Hybrid search (dense + BM25 + rerank) over the whole ingested corpus — no table/doc selection, content similarity does the work |
+| Employee record | `search_employee_record(tables)` | The model names 0+ tables from `TABLE_CATALOG` (`employee_leaves`, `leave_requests`, `compensation`, `expense_reports`); the core profile is always included regardless |
+| Web | `search_web(query)` | Claude's own native `web_search_20260209` tool, restricted to `WEB_SEARCH_ALLOWED_DOMAINS` |
+| None | — | Model answers directly (e.g. "hi") — no tool call at all |
+
+`Reasoning` can call more than one retrieval type in the same pass (`ToolNode` runs them in parallel) before deciding whether it has enough — that's why "PTO balance and recent expenses" resolved in one turn with one `search_employee_record` call requesting two tables, rather than needing a full extra loop.
+
+## 8. Request lifecycle: login through a streamed answer
+
+```mermaid
+stateDiagram-v2
+    [*] --> LoggedOut
+    LoggedOut --> Authenticating: POST /login {employee_id, password}
+    Authenticating --> LoggedOut: invalid credentials (401)
+    Authenticating --> Chatting: verified -- session_store issues a token
+
+    Chatting --> Streaming: POST /chat {message} + Bearer token
+    Streaming --> Streaming: SSE "token" events, appended to the answer as they arrive
+    Streaming --> Chatting: SSE "done" event (escalated, tools_used) -- turn complete
+    Streaming --> Chatting: SSE "error" event -- graceful fallback message shown, session untouched
+
+    Chatting --> LoggedOut: POST /logout -- token deleted
+```
+
+Every `Chatting -> Streaming -> Chatting` cycle is one turn; the browser tab can sit in `Chatting` indefinitely between turns, and conversation memory (LangGraph's checkpoint for that token) persists across every cycle until the token itself is invalidated.
+
+## 9. End-to-end: one chat turn, start to finish (streaming)
 
 ```mermaid
 sequenceDiagram
     participant U as Browser
-    participant API as api.py (FastAPI)
+    participant API as api.py (FastAPI, SSE)
     participant SS as session_store
-    participant AG as agent.py (LangGraph)
+    participant AG as agent.py (run_turn_stream)
     participant LG as LangGraph runtime<br/>(MemorySaver)
     participant CL as Claude API
     participant VS as vector_store.py
@@ -228,17 +283,23 @@ sequenceDiagram
     U->>API: POST /chat {message} + Bearer token
     API->>SS: get_session(token)
     SS-->>API: employee_id
-    API->>AG: run_turn(token, employee_id, message)
-    AG->>LG: graph.invoke({messages:[Human(message)], ...}, thread_id=token)
+    API->>AG: run_turn_stream(token, employee_id, message)
+    AG->>LG: graph.stream({messages:[Human(message)], ...}, thread_id=token, stream_mode="messages")
     LG->>LG: restore prior messages for this thread_id<br/>(add_messages reducer appends new message)
 
     loop until no tool calls
-        LG->>CL: agent node: ChatAnthropic.invoke(system + messages)
-        CL-->>LG: AIMessage (text, and/or tool_calls)
+        LG->>CL: agent node: ChatAnthropic.stream(system + messages)
+        loop each text delta from Claude
+            CL-->>LG: AIMessageChunk (text delta)
+            LG-->>AG: (chunk, metadata)
+            AG-->>API: {"type":"token", "text": ...}
+            API-->>U: SSE data: {"type":"token", ...}<br/>(browser appends to the growing bubble)
+        end
+        CL-->>LG: tool_calls (if any, on this iteration's final chunk)
         alt model called tools
             LG->>VS: search_policy_db(query) [if called]
             VS-->>LG: wrapped chunks (untrusted_context)
-            LG->>DB: search_employee_record(topic, employee_id=<injected>) [if called]
+            LG->>DB: search_employee_record(tables, employee_id=<injected>) [if called]
             DB-->>LG: wrapped chunks (untrusted_context)
             LG->>LG: check_escalation node:<br/>escalate_to_deep_reasoning called? -> model_tier="deep"
         else no tool calls
@@ -246,22 +307,23 @@ sequenceDiagram
         end
     end
 
-    LG-->>AG: final state (messages, escalated, escalation_reason)
-    AG->>AG: extract answer text, tool-call log
-    AG-->>API: AgentTurnResult
+    LG-->>AG: final checkpointed state (escalated, escalation_reason, tools_used)
+    AG-->>API: {"type":"done", ...}
     API->>API: logging_util.log_query(...)
-    API-->>U: {answer, escalated, escalation_reason, tools_used}
+    API-->>U: SSE data: {"type":"done", ...}<br/>(escalated badge applied if true)
 ```
 
-## 8. Data transformations, summarized
+Note the loop-within-a-loop: each pass through the tool-call loop can itself stream several text-delta chunks before the model either calls a tool or finishes — that's why partial "thinking out loud" text can appear even on a turn that ultimately calls a tool.
+
+## 10. Data transformations, summarized
 
 | Stage | Input | Transformation | Output |
 |---|---|---|---|
 | Policy ingest | `.md` file | Frontmatter parsed off, body split on `##`, each section embedded + BM25-indexed | Chroma chunks + metadata |
 | Policy query | query string | Dense + sparse retrieval → RRF fusion → cross-encoder rerank → top 4 | `RetrievedChunk[]` → `wrap_untrusted()` text |
-| Employee query | `(employee_id, topic)` | Parameterized SQL against 5 tables, keyword-gated by `topic` | `RetrievedChunk[]` → `wrap_untrusted()` text |
+| Employee query | `(employee_id, tables: list[str])` | Core record always fetched (indexed `SEARCH` on `employees`' PK); each requested table name in `tables` that matches `TABLE_CATALOG` runs its own indexed, parameterized `SELECT ... WHERE employee_id = ?` | `RetrievedChunk[]` → `wrap_untrusted()` text |
 | Web query | query string | Claude API call with native `web_search` tool, domain-allowlisted | Claude's synthesized text → `RetrievedChunk` → `wrap_untrusted()` text |
 | Conversation | new `HumanMessage` | LangGraph's `add_messages` reducer appends to the checkpointed history for that `thread_id` | Full message list passed to the model each turn |
-| Model response | `AIMessage` (+ optional `tool_calls`) | If tool calls present: routed to `tools` node, results appended as `ToolMessage`s, loop continues. If not: loop ends | Final answer text extracted via `_extract_text()` |
+| Model response | stream of `AIMessageChunk`s (+ eventual `tool_calls`) | Each text-bearing chunk from the `agent` node is yielded immediately as a `{"type":"token"}` event; if the completed message carries tool calls, routed to `tools` node and the loop continues | Live token stream to the browser, plus (once done) `ToolMessage`s appended for the next loop iteration |
 | Escalation | `escalate_to_deep_reasoning` tool call | `check_escalation` node flips `model_tier` in graph state | Next `agent` node invocation uses `DEEP_MODEL` instead of `LIGHT_MODEL` |
 | Logging | query + turn result | `redact_pii()` on the query text, structured JSON assembled | One log line: timestamp, employee_id, query, tools used, escalated, latency |
