@@ -83,6 +83,18 @@ CREATE TABLE expense_reports (
   submitted_date TEXT,
   approver_id    TEXT           -- nullable
 );
+
+-- employees.employee_id is already indexed automatically (it's the
+-- PRIMARY KEY there), but employee_id in these four tables is a plain
+-- foreign-key-shaped column with no index of its own -- every lookup in
+-- hr_rag/sources/employee_db.py filters on it, so without these it's a
+-- full table SCAN instead of an indexed SEARCH (confirmed via
+-- EXPLAIN QUERY PLAN). Composite on employee_leaves since that table is
+-- always queried on (employee_id, leave_year) together.
+CREATE INDEX idx_employee_leaves_employee_id ON employee_leaves(employee_id, leave_year);
+CREATE INDEX idx_leave_requests_employee_id ON leave_requests(employee_id);
+CREATE INDEX idx_compensation_employee_id ON compensation(employee_id);
+CREATE INDEX idx_expense_reports_employee_id ON expense_reports(employee_id);
 """
 
 EMPLOYEES = [
