@@ -8,7 +8,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from hr_rag.auth import hash_password
 from hr_rag.config import EMPLOYEE_DB_PATH
+
+# Demo login password for every sample employee -- v2 adds real (if simple)
+# auth; this is intentionally documented rather than a per-user secret,
+# since these are sample/demo accounts, not real credentials.
+DEMO_PASSWORD = "changeme123"
 
 SCHEMA = """
 -- Core identity + role data. Anchors self-scoping, tenure calcs (parental
@@ -23,7 +29,9 @@ CREATE TABLE employees (
   start_date       DATE,        -- drives tenure-based eligibility
   location         TEXT,        -- city/country, for region-specific policy variants
   manager_id       TEXT,        -- nullable, FK -> employees.employee_id (future RBAC)
-  status           TEXT         -- active / on_leave / terminated
+  status           TEXT,        -- active / on_leave / terminated
+  password_salt    TEXT,        -- hex-encoded, per-user random salt
+  password_hash    TEXT         -- pbkdf2_hmac-sha256 hex digest; see hr_rag/auth.py
 );
 
 -- One row per employee per leave_year, tracking PTO and sick leave together.
@@ -75,6 +83,18 @@ CREATE TABLE expense_reports (
   submitted_date TEXT,
   approver_id    TEXT           -- nullable
 );
+
+-- employees.employee_id is already indexed automatically (it's the
+-- PRIMARY KEY there), but employee_id in these four tables is a plain
+-- foreign-key-shaped column with no index of its own -- every lookup in
+-- hr_rag/sources/employee_db.py filters on it, so without these it's a
+-- full table SCAN instead of an indexed SEARCH (confirmed via
+-- EXPLAIN QUERY PLAN). Composite on employee_leaves since that table is
+-- always queried on (employee_id, leave_year) together.
+CREATE INDEX idx_employee_leaves_employee_id ON employee_leaves(employee_id, leave_year);
+CREATE INDEX idx_leave_requests_employee_id ON leave_requests(employee_id);
+CREATE INDEX idx_compensation_employee_id ON compensation(employee_id);
+CREATE INDEX idx_expense_reports_employee_id ON expense_reports(employee_id);
 """
 
 EMPLOYEES = [
@@ -131,11 +151,15 @@ def seed():
             conn.execute(f"DROP TABLE IF EXISTS {table}")
         conn.executescript(SCHEMA)
 
+        employees_with_auth = [
+            row + hash_password(DEMO_PASSWORD) for row in EMPLOYEES
+        ]
         conn.executemany(
             "INSERT INTO employees "
             "(employee_id, full_name, email, job_title, department, employment_type, "
-            "start_date, location, manager_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            EMPLOYEES,
+            "start_date, location, manager_id, status, password_salt, password_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            employees_with_auth,
         )
         conn.executemany(
             "INSERT INTO employee_leaves "
@@ -166,6 +190,7 @@ def seed():
     finally:
         conn.close()
     print(f"Seeded {len(EMPLOYEES)} employees across 5 tables into {EMPLOYEE_DB_PATH}")
+    print(f"Demo login password for every sample employee: {DEMO_PASSWORD}")
 
 
 if __name__ == "__main__":

@@ -59,24 +59,8 @@ def wrap_untrusted(chunks: list[RetrievedChunk]) -> str:
     return "\n".join(blocks)
 
 
-def has_relevant_content(chunks: list[RetrievedChunk]) -> bool:
-    return any(chunk.text.strip() for chunk in chunks)
-
-
 ASSISTANT_UNAVAILABLE_ANSWER = (
     "Sorry, the assistant is temporarily unavailable (a backend request "
     "failed). Please try again in a moment, or reach out to HR directly if "
     "this keeps happening."
-)
-
-NO_HR_INTENT_ANSWER = (
-    "Hi! I can help answer questions about company policy, your own HR "
-    "records (leave, compensation, expenses, etc.), or general regulatory "
-    "info. What would you like to know?"
-)
-
-NO_SOURCE_ANSWER = (
-    "I couldn't find anything in your records, company policy, or approved "
-    "web sources that answers this. Please rephrase your question or reach "
-    "out to HR directly so a person can help."
 )

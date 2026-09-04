@@ -1,12 +1,20 @@
-"""HR Portal RAG prototype -- CLI entrypoint.
+"""HR Portal RAG -- terminal dev/test harness.
 
-Simulates authentication by having the user pick an employee id at startup;
-the pipeline scopes every employee_db query to that id (PRD section 4).
+Fast way to exercise hr_rag/agent.py without the web layer -- skips real
+login (just picks an employee id like v1's CLI did), but the underlying
+agent.run_turn_stream() is exactly what api.py's /chat endpoint streams
+from, so behavior (including streaming) matches the web UI.
 """
 
+import secrets
 import sys
 
-from hr_rag import pipeline
+import anthropic
+from langgraph.errors import GraphRecursionError
+
+from hr_rag import agent
+from hr_rag.guardrails import ASSISTANT_UNAVAILABLE_ANSWER
+from hr_rag.logging_util import log_error
 from hr_rag.sources.employee_db import get_my_record
 
 SAMPLE_IDS = ["E1001", "E1002", "E1003", "E1004"]
@@ -27,6 +35,7 @@ def pick_employee() -> str:
 
 def main():
     employee_id = pick_employee()
+    token = secrets.token_urlsafe(16)  # local thread_id for this run only, no real session
     print(f"\nLogged in as {employee_id}. Ask an HR question (Ctrl+D to quit).\n")
 
     while True:
@@ -38,10 +47,23 @@ def main():
         if not query:
             continue
 
-        result = pipeline.run(employee_id, query)
-        print(f"\n{result.answer}\n")
-        tag = " (escalated)" if result.escalated else ""
-        print(f"[sources: {', '.join(result.sources_selected) or 'none'}{tag}]\n")
+        print()
+        escalated = False
+        tools_used: list[str] = []
+        try:
+            for event in agent.run_turn_stream(token, employee_id, query):
+                if event["type"] == "token":
+                    print(event["text"], end="", flush=True)
+                else:
+                    escalated = event["escalated"]
+                    tools_used = event["tools_used"]
+        except (anthropic.AnthropicError, GraphRecursionError) as e:
+            log_error(employee_id=employee_id, query=query, error=e)
+            print(f"{ASSISTANT_UNAVAILABLE_ANSWER}\n")
+            continue
+
+        tag = " (escalated)" if escalated else ""
+        print(f"\n\n[tools used: {', '.join(tools_used) or 'none'}{tag}]\n")
 
 
 if __name__ == "__main__":
