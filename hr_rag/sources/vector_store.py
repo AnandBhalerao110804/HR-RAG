@@ -190,6 +190,10 @@ def search(query: str, n_results: int = 4) -> list[RetrievedChunk]:
         ][:n_results]
 
     return [
-        RetrievedChunk(source="policy_db", text=id_to_doc[id_], metadata=id_to_meta[id_])
+        RetrievedChunk(
+            source="policy_db",
+            text=id_to_doc[id_],
+            metadata={**id_to_meta[id_], "chunk_id": id_},
+        )
         for id_ in top_ids
     ]

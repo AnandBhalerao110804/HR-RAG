@@ -15,5 +15,8 @@ data/chroma_store/
 
 hr_rag_policy_pack_india/
 
+# Eval reports -- generated output, not source
+eval/results/
+
 # OS
 .DS_Store
