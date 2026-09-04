@@ -213,7 +213,32 @@ stateDiagram-v2
 - Loop repeats until the model responds with no tool calls, or `MAX_ITERATIONS` (recursion cap) is hit.
 - `agent.run_turn_stream()` drives this exact graph via `graph.stream(..., stream_mode="messages")`, yielding each text token the `agent` node produces (across every loop iteration) as it's generated, then one final event with `escalated`/`escalation_reason`/`tools_used` once the graph reaches `[*]`. `run_turn()` (still used by tests and anywhere a single blocking result is more convenient) is a thin wrapper that just concatenates the streamed tokens.
 
-## 7. What kind of retrieval happens, and who decides
+## 7. The agent framework: LangGraph, and exactly what it's doing for us
+
+The agent is built on **LangGraph** (`langgraph`) + **`langchain-anthropic`**, not a hand-rolled tool-call loop and not the raw Anthropic SDK's beta Tool Runner. This was a deliberate choice, made explicitly (not a default) when the system moved from v1's fixed pipeline to an agent: LangGraph is more machinery than a single-branch, four-tool graph strictly needs, but it was chosen anticipating the graph growing (more branches, possibly multiple cooperating agents later), and because its checkpointer turned out to be an exact fit for "give this thing multi-turn memory."
+
+Every LangGraph/LangChain feature actually in use, and why:
+
+| Feature | Where | What it buys us |
+|---|---|---|
+| `StateGraph` + a typed `AgentState` (`TypedDict`) | `agent.py`, top of the file | Declares the shape of everything that flows through the graph (`messages`, `employee_id`, `model_tier`, `escalated`, `escalation_reason`) so every node reads/writes a known schema instead of an untyped dict |
+| `Annotated[list, add_messages]` reducer | `AgentState.messages` | LangGraph's built-in message reducer — new messages **append** to existing history instead of overwriting it. This single line is what makes multi-turn memory work at all |
+| `MemorySaver` checkpointer | `_build_graph()`, `graph.compile(checkpointer=...)` | Persists graph state (mainly `messages`) in-process, keyed by `thread_id`. This is the entire multi-turn memory mechanism — no hand-written session/message-list management anywhere in `agent.py` |
+| `thread_id` (session token doubles as this) | `run_turn_stream()`'s `config={"configurable": {"thread_id": token}}` | Ties one browser login session to one persistent conversation in the checkpointer. Same token = same conversation resumed; a new token = a fresh thread with no memory of any other session |
+| `graph.get_state(config)` | `run_turn_stream()`, both to find `prior_len` before a turn and to read final `escalated`/`tools_used` after | Reads the checkpointer directly — lets us diff "what's new this turn" against "what was already there" without the graph handing back that distinction itself |
+| Prebuilt `ToolNode` | `_build_graph()`, the `tools` node | Executes whatever tools the model's `AIMessage.tool_calls` named — **concurrently** if it called more than one — and appends the resulting `ToolMessage`s. This is also why `vector_store._get_collection()` needed a thread-safety fix (§ elsewhere) — `ToolNode` genuinely runs calls in parallel threads, not just conceptually |
+| `InjectedState` | `search_employee_record`'s `employee_id` parameter | Lets a tool read a value out of graph state at execution time without that value ever appearing in the tool's model-visible schema. This is the mechanism the whole employee-scoping security invariant is built on — not a convention, an actual LangGraph primitive |
+| Conditional edges (`add_conditional_edges`) | `agent -> tools` vs `agent -> END` | The routing decision ("did the model just call a tool, or is this the final answer?") lives here as a plain Python function (`route_after_agent`) inspecting `AIMessage.tool_calls` — no LLM call needed to make that decision, it's mechanical |
+| `stream_mode="messages"` | `run_turn_stream()` | Streams individual `(AIMessageChunk, metadata)` tuples as the model generates them, including a `langgraph_node` field used to filter to only the `agent` node's output (tool-internal chunks stay invisible to the user) |
+| `recursion_limit` | `run_turn_stream()`'s `config`, set to `MAX_ITERATIONS` | LangGraph's built-in loop-iteration cap — guards against a runaway agent/tool-call cycle within one turn; raises `GraphRecursionError` (caught in `api.py`/`cli.py`) rather than looping forever |
+| `ChatAnthropic` (`langchain-anthropic`) | `_make_model()` | The LangChain-native wrapper around the Anthropic Messages API — handles translating LangChain's `Tool`/message objects to and from Anthropic's wire format, so `agent.py` never constructs raw Anthropic API JSON by hand |
+| `.bind_tools(_TOOLS)` | `_make_model()` | Attaches the tool schemas to a model instance once; every `.invoke()`/`.stream()` call on that bound model automatically includes them |
+| `@tool` decorator (`langchain_core.tools`) | Every tool function in `agent.py` | Generates a tool's JSON schema from its Python type hints + docstring, so schemas stay in sync with the actual function signature instead of being hand-written and prone to drift |
+| Message types (`HumanMessage`, `AIMessage`, `SystemMessage`, `ToolMessage`, `AIMessageChunk`) | Throughout `agent.py` | LangChain's typed message objects, not raw dicts — e.g. `isinstance(msg, AIMessage)` is how `tools_used` gets extracted, and `AIMessage.tool_calls` is a structured list rather than something parsed out of raw JSON |
+
+**Deliberately not used**: the beta Anthropic Tool Runner (`client.beta.messages.tool_runner`) — this project has consistently avoided beta-dependent surfaces (the same reasoning that chose structured JSON output over the beta tool runner back in v1); and LangGraph's `create_react_agent` prebuilt — the hand-assembled `StateGraph` here is barely bigger than that prebuilt would be, and building it explicitly is what makes the `check_escalation` node (and the model-tier switch it drives) possible at all, which isn't something a generic ReAct-agent prebuilt exposes a hook for.
+
+## 8. What kind of retrieval happens, and who decides
 
 This is the part that replaced v1's fixed routing: there's no upfront classifier deciding "this needs policy_db." The model itself, inside the `agent` node above, decides per-turn (and can change its mind mid-turn) which of three retrieval types it needs, if any:
 
@@ -248,7 +273,7 @@ Each retrieval type, concretely:
 
 `Reasoning` can call more than one retrieval type in the same pass (`ToolNode` runs them in parallel) before deciding whether it has enough — that's why "PTO balance and recent expenses" resolved in one turn with one `search_employee_record` call requesting two tables, rather than needing a full extra loop.
 
-## 8. Request lifecycle: login through a streamed answer
+## 9. Request lifecycle: login through a streamed answer
 
 ```mermaid
 stateDiagram-v2
@@ -267,7 +292,41 @@ stateDiagram-v2
 
 Every `Chatting -> Streaming -> Chatting` cycle is one turn; the browser tab can sit in `Chatting` indefinitely between turns, and conversation memory (LangGraph's checkpoint for that token) persists across every cycle until the token itself is invalidated.
 
-## 9. End-to-end: one chat turn, start to finish (streaming)
+## 10. Session creation and management
+
+There are actually **two separate session concepts** here, both keyed by the same bearer token but living in different places and owned by different code:
+
+| | Auth session | Conversation session |
+|---|---|---|
+| Owns it | `hr_rag/session_store.py` | LangGraph's `MemorySaver` checkpointer (inside `hr_rag/agent.py`) |
+| Key | the bearer token, as a dict key | the same token, passed as `thread_id` |
+| Holds | `AuthSession(employee_id, created_at)` — just who's logged in | The full `messages` list (and `model_tier`/`escalated`/`escalation_reason`) for that conversation |
+| Created | `session_store.create_session()`, called from `POST /login` | Implicitly, the first time `graph.invoke`/`graph.stream` runs with a `thread_id` LangGraph hasn't seen before — there's no separate "create conversation" call |
+| Destroyed | `session_store.delete_session()`, called from `POST /logout` | **Not destroyed by `/logout`** — see below |
+
+**Creation** (`POST /login`, `api.py`):
+```python
+if not auth.verify_login(body.employee_id, body.password):
+    raise HTTPException(status_code=401, ...)
+token = session_store.create_session(body.employee_id)
+return LoginResponse(token=token)
+```
+`create_session()` generates the token via `secrets.token_urlsafe(32)` — a cryptographically random opaque string, not a JWT, so it carries no embedded claims and can't be decoded/inspected client-side; it's purely a lookup key. The auth session is created here; the conversation session doesn't exist yet — it comes into being lazily on the first `/chat` call for that token.
+
+**Lookup, every authenticated request** (`_require_session()`, `api.py`): pulls the token off the `Authorization: Bearer <token>` header, looks it up in `session_store`, 401s if missing or unrecognized. This runs before every `/chat` and `/logout` call.
+
+**Growth, every turn**: each `/chat` call passes the same token as `thread_id` into `agent.run_turn_stream()`. LangGraph's `add_messages` reducer appends the new turn's messages onto whatever's already checkpointed for that `thread_id` — this is the entire mechanism, there's no explicit "load history, append, save" code anywhere in this codebase to maintain.
+
+**Destruction** (`POST /logout`, `api.py`):
+```python
+token, _ = _require_session(authorization)
+session_store.delete_session(token)
+```
+This deletes the **auth session** only — the token immediately stops working for `/chat` (a 401 on the next lookup). The **conversation session** in LangGraph's checkpointer is not explicitly cleared; it just becomes unreachable, since nothing will ever present that token again as a valid, authenticated `thread_id`. In practice this is harmless (a logged-out token can never be used to resume that conversation, since auth is checked first, before the token ever reaches `agent.py`), but it does mean the checkpointer's memory for that thread isn't freed until the whole process restarts — a real, acknowledged limitation for a long-running deployment, not an oversight for this prototype's scope.
+
+**Lifetime and persistence, both sessions**: pure in-memory Python dicts (`session_store._SESSIONS`, and `MemorySaver`'s internal store) — nothing touches disk. A server restart wipes every logged-in session and every conversation's memory at once. There's no session expiry/TTL implemented on either side — a token is valid indefinitely until an explicit `/logout` or a process restart, which is a reasonable simplification for a prototype but would need addressing (idle timeout, at minimum) before this ran as anything other than a demo.
+
+## 11. End-to-end: one chat turn, start to finish (streaming)
 
 ```mermaid
 sequenceDiagram
@@ -315,7 +374,7 @@ sequenceDiagram
 
 Note the loop-within-a-loop: each pass through the tool-call loop can itself stream several text-delta chunks before the model either calls a tool or finishes — that's why partial "thinking out loud" text can appear even on a turn that ultimately calls a tool.
 
-## 10. Data transformations, summarized
+## 12. Data transformations, summarized
 
 | Stage | Input | Transformation | Output |
 |---|---|---|---|

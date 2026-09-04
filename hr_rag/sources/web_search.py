@@ -28,6 +28,12 @@ def search(query: str) -> list[RetrievedChunk]:
                 "name": "web_search",
                 "allowed_domains": WEB_SEARCH_ALLOWED_DOMAINS,
                 "max_uses": WEB_SEARCH_MAX_USES,
+                # Without this, the API defaults to requiring programmatic
+                # tool calling support (i.e. invocation from within code
+                # execution), which claude-haiku-4-5 doesn't support. This
+                # call is always a direct, single-turn tool use -- never
+                # invoked from code execution -- so declare that explicitly.
+                "allowed_callers": ["direct"],
             }
         ],
         messages=[
