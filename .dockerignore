@@ -1,0 +1,15 @@
+.venv
+venv
+.git
+.gitignore
+data/chroma_store
+data/employees.db
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+eval/results
+.env
+infra
+*.md
+hr_rag_policy_pack_india

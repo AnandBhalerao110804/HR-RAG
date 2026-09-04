@@ -20,3 +20,10 @@ eval/results/
 
 # OS
 .DS_Store
+
+# Terraform -- state and vars hold real infra data / the Anthropic API key
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.backup
+infra/terraform.tfvars
+infra/*.tfplan

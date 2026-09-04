@@ -1,0 +1,8 @@
+# Copy this file to terraform.tfvars (gitignored) and fill in real values.
+# Never commit terraform.tfvars -- it will hold your Anthropic API key.
+
+region             = "us-east-1"
+ssh_allowed_cidr   = "YOUR.IP.ADDR.ESS/32"   # find yours: curl -s ifconfig.me
+anthropic_api_key  = "sk-ant-..."
+key_name           = "your-existing-ec2-keypair-name"
+# instance_type and repo_url have sensible defaults -- override only if needed
